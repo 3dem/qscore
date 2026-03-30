@@ -1,6 +1,7 @@
 import os.path
 
 import numpy as np
+from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 from qscore.mrc_utils import MRCObject, load_mrc
@@ -19,9 +20,10 @@ def calculate_q_score(
     ref_gaussian_height, ref_gaussian_offset = get_reference_gaussian_params(map)
     reference_gaussian_values = []
     map_values = []
+    kdtree = cKDTree(atoms)
     for R in tqdm(range(21)):
         R /= 10
-        radial_points = get_radial_points(atoms, R, num_points)
+        radial_points = get_radial_points(atoms, R, num_points, kdtree=kdtree)
         map_values_at_points = interpolate_grid_at_points(radial_points[0], map)
         map_values.append(map_values_at_points)
         ref_gaussian_value_at_R = ref_gaussian_height * np.exp(
@@ -42,11 +44,12 @@ def calculate_per_residue_q_scores(
         structure_path: str,
         map_path: str,
         output_path: str,
+        num_points: int = 8,
 ):
     prot = get_protein_from_file_path(structure_path)
     map = load_mrc(map_path, False)
     atoms = prot.atom_positions[prot.atom_mask.astype(bool)]
-    q_scores = calculate_q_score(atoms, map)
+    q_scores = calculate_q_score(atoms, map, num_points=num_points)
     q_score_per_residue = np.zeros_like(prot.atom_mask, dtype=np.float32)
     q_score_per_residue[prot.atom_mask.astype(bool)] = q_scores
     q_score_per_residue = q_score_per_residue.sum(axis=1) / prot.atom_mask.sum(axis=1)

@@ -1,16 +1,24 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
+from scipy.ndimage import map_coordinates
 from scipy.spatial import cKDTree
-from scipy.interpolate import interpn
 
 from qscore.mrc_utils import MRCObject
 
 
 def sample_uniformly_on_sphere(sphere_radius: float, num_points: int) -> np.ndarray:
-    points = np.random.randn(num_points, 3)
-    points /= np.linalg.norm(points, axis=-1, ord=2, keepdims=True)
-    return points * sphere_radius
+    u = np.random.random(num_points)
+    v = np.random.random(num_points)
+    z = 2.0 * u - 1.0
+    phi = 2.0 * np.pi * v
+    r_xy = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    points = np.empty((num_points, 3), dtype=np.float64)
+    points[:, 0] = r_xy * np.cos(phi)
+    points[:, 1] = r_xy * np.sin(phi)
+    points[:, 2] = z
+    points *= sphere_radius
+    return points
 
 def get_reference_gaussian_params(map: MRCObject) -> Tuple[float, float]:
     map_max = np.max(map.grid)
@@ -24,41 +32,55 @@ def get_reference_gaussian_params(map: MRCObject) -> Tuple[float, float]:
     return reference_gaussian_height, reference_gaussian_offset
 
 
-def get_radial_points(atoms: np.ndarray, sphere_radius: float, num_points: int) -> Tuple[np.ndarray, np.ndarray]:
-    radial_points = np.zeros((len(atoms), num_points, 3))
-    point_exists = np.zeros((len(atoms), num_points), dtype=bool)
-    kdtree = cKDTree(atoms)
-    for num_try in range(100):
-        atoms_left = ~np.all(point_exists, axis=-1)
-        num_atoms_left = np.sum(atoms_left)
+def get_radial_points(
+        atoms: np.ndarray,
+        sphere_radius: float,
+        num_points: int,
+        kdtree: Optional[cKDTree] = None,
+        query_workers: int = -1,
+) -> Tuple[np.ndarray, np.ndarray]:
+    num_atoms = len(atoms)
+    radial_points = np.zeros((num_atoms, num_points, 3), dtype=atoms.dtype)
+    if kdtree is None:
+        kdtree = cKDTree(atoms)
+    fill_counts = np.zeros(num_atoms, dtype=np.int16)
+    atom_indices = np.arange(num_atoms)
+    for _ in range(100):
+        atoms_left = fill_counts < num_points
+        if not np.any(atoms_left):
+            break
+        atom_indices_left = atom_indices[atoms_left]
+        num_atoms_left = len(atom_indices_left)
         sphere_points = sample_uniformly_on_sphere(
             sphere_radius, num_points * num_atoms_left
-        ).reshape((num_atoms_left, num_points, 3))
+        ).reshape((num_atoms_left, num_points, 3)).astype(atoms.dtype, copy=False)
         sphere_points += atoms[atoms_left, None]
-        # Check if each sphere point is closest to the atom it originates from
-        indices = kdtree.query(sphere_points, k=1, workers=4)[1]
-        indices_that_match = indices == np.arange(len(atoms))[atoms_left, None] # A x N
-        if num_try > 3:
-            sort_idx_pe = np.argsort(~point_exists[atoms_left], axis=1)  # True values first
-            point_exists[atoms_left] = np.take_along_axis(point_exists[atoms_left], sort_idx_pe, axis=1)
-            radial_points[atoms_left] = np.take_along_axis(radial_points[atoms_left], sort_idx_pe[..., None], axis=1)
-            sort_idx_sp = np.argsort(indices_that_match, axis=1)  # False values first
-            indices_that_match = np.take_along_axis(indices_that_match, sort_idx_sp, axis=1)
-            sphere_points = np.take_along_axis(sphere_points, sort_idx_sp[..., None], axis=1)
-        idxs_to_update = np.nonzero(indices_that_match & ~point_exists[atoms_left])  # Not exactly optimal, probably should sort first
-        radial_points[np.nonzero(atoms_left)[0][idxs_to_update[0]], idxs_to_update[1]] = sphere_points[idxs_to_update[0], idxs_to_update[1]]
-        point_exists[np.nonzero(atoms_left)[0][idxs_to_update[0]], idxs_to_update[1]] = True
-        if np.all(point_exists):
-            break
+        indices = kdtree.query(sphere_points, k=1, workers=query_workers)[1]
+        valid = indices == atom_indices_left[:, None]
+        rank = np.cumsum(valid, axis=1) - 1
+        remaining = (num_points - fill_counts[atom_indices_left])[:, None]
+        chosen = valid & (rank < remaining)
+        if not np.any(chosen):
+            continue
+        atom_assign = np.broadcast_to(atom_indices_left[:, None], chosen.shape)[chosen]
+        slot_assign = (fill_counts[atom_indices_left][:, None] + rank)[chosen]
+        radial_points[atom_assign, slot_assign] = sphere_points[chosen]
+        fill_counts[atom_indices_left] += chosen.sum(axis=1).astype(fill_counts.dtype)
+    point_exists = np.arange(num_points)[None, :] < fill_counts[:, None]
     return radial_points, point_exists
 
 
 def interpolate_grid_at_points(points: np.ndarray, map: MRCObject) -> np.ndarray:
-    x = np.arange(map.grid.shape[0])
-    y = np.arange(map.grid.shape[1])
-    z = np.arange(map.grid.shape[2])
     points = np.flip(points, axis=-1)
     # Origin should be flipped the same way, thank you Sjors
     flipped_origin = np.flip(map.global_origin, axis=-1)
-    p = (points - flipped_origin[None]) / map.voxel_size
-    return interpn((x, y, z), map.grid, p)
+    p = ((points - flipped_origin[None]) / map.voxel_size).reshape(-1, 3).T
+    values = map_coordinates(
+        map.grid,
+        p,
+        order=1,
+        mode="constant",
+        cval=np.nan,
+        prefilter=False,
+    )
+    return values.reshape(points.shape[:-1])
